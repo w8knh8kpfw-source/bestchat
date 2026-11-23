@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS bot_owner (id integer PRIMARY KEY CHECK (id=1), teleg
 CREATE TABLE IF NOT EXISTS business_messages (business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, sender text, chat_title text, text_content text NOT NULL DEFAULT '', caption_content text NOT NULL DEFAULT '', media jsonb NOT NULL DEFAULT '{}'::jsonb, message_date bigint, edited_at bigint, is_edited boolean NOT NULL DEFAULT false, saved_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (business_connection_id,chat_id,message_id));
 CREATE TABLE IF NOT EXISTS message_edits (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, old_text text NOT NULL DEFAULT '', new_text text NOT NULL DEFAULT '', edited_at bigint, recorded_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS deletion_events (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, archived_text text NOT NULL DEFAULT '', sender text, chat_title text, detected_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS archived_media (business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, media_type text NOT NULL, file_name text, mime_type text, file_size bigint, file_bytes bytea NOT NULL, saved_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (business_connection_id,chat_id,message_id));
 """
 ALLOWED_TABLES = {"bot_owner","business_messages","message_edits","deletion_events"}
 
@@ -79,6 +80,24 @@ async def tg(method: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not data.get("ok"):
             raise RuntimeError(f"Telegram API error: {data}")
         return data.get("result", {})
+
+
+async def download_media(file_id: str):
+    """Download ordinary media exposed to the Business bot; never bypass ephemeral/protected media."""
+    try:
+        info = await tg("getFile", {"file_id": file_id})
+        file_path = info.get("file_path")
+        file_size = int(info.get("file_size") or 0)
+        if not file_path or file_size > 20 * 1024 * 1024:
+            return None
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}")
+            response.raise_for_status()
+            return response.content
+    except Exception:
+        # Download URLs contain the bot token; never log exception details.
+        log.warning("Ordinary media download failed; metadata remains archived.")
+        return None
 
 
 async def owner():
@@ -174,6 +193,18 @@ async def save_business_message(message: dict[str, Any], edited: bool = False):
     await db("POST", "business_messages", body=payload,
              prefer="resolution=merge-duplicates,return=minimal")
 
+    if media.get("file_id"):
+        file_bytes = await download_media(media["file_id"])
+        if file_bytes is not None:
+            await db("POST", "archived_media", body={
+                **key,
+                "media_type": media.get("type") or "file",
+                "file_name": media.get("file_name"),
+                "mime_type": media.get("mime_type"),
+                "file_size": len(file_bytes),
+                "file_bytes": file_bytes,
+            }, prefer="resolution=merge-duplicates,return=minimal")
+
     if edited and old:
         await notify_owner(
             "✏️ Сообщение изменено\n"
@@ -224,6 +255,51 @@ async def handle_deleted(update: dict[str, Any]):
             )
 
 
+async def send_home(chat_id: int, text: str):
+    await tg("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": {"inline_keyboard": [
+            [{"text": "🔌 Подключить Telegram Business", "callback_data": "connect"}],
+            [{"text": "▶️ Включить архив", "callback_data": "enable"}, {"text": "⏸ Пауза", "callback_data": "pause"}],
+            [{"text": "📊 Статус", "callback_data": "status"}, {"text": "❔ Помощь", "callback_data": "help"}]
+        ]}
+    })
+
+
+async def handle_callback(query: dict[str, Any]):
+    data = query.get("data") or ""
+    user_id = (query.get("from") or {}).get("id")
+    chat_id = ((query.get("message") or {}).get("chat") or {}).get("id")
+    if query.get("id"):
+        await tg("answerCallbackQuery", {"callback_query_id": query["id"]})
+    current = await owner()
+    if not current or current.get("telegram_user_id") != user_id:
+        if chat_id:
+            await tg("sendMessage", {"chat_id": chat_id, "text": "Это меню доступно только владельцу BestChat."})
+        return
+    if data == "connect":
+        answer = ("🔌 ПОДКЛЮЧЕНИЕ TELEGRAM BUSINESS\n\n"
+                  "1. Открой @BotFather и выбери BestChat.\n"
+                  "2. Включи Business Mode / Secretary Mode в настройках бота.\n"
+                  "3. Открой Настройки Telegram → Telegram Business → Чат-боты.\n"
+                  "4. Выбери BestChat, укажи доступные чаты и подтверди подключение.\n\n"
+                  "Без включённого Secretary Mode Telegram не разрешит подключение.")
+    elif data == "enable":
+        await db("PATCH", "bot_owner", params={"id":"eq.1"}, body={"enabled":True}, prefer="return=minimal")
+        answer = "✅ Архив включён. Сохраняются только данные, которые Telegram передаёт подключённому бизнес-боту."
+    elif data == "pause":
+        await db("PATCH", "bot_owner", params={"id":"eq.1"}, body={"enabled":False}, prefer="return=minimal")
+        answer = "⏸ Архив приостановлен."
+    elif data == "status":
+        answer = "📊 Архив: " + ("включён" if current.get("enabled") else "приостановлен") + "\nПодключение проверь в настройках Telegram Business."
+    else:
+        answer = ("❔ BestChat сохраняет обычные бизнес-сообщения, изменения, события удаления, "
+                  "а также доступные обычные фото, видео, кружки и документы. "
+                  "Одноразовые и защищённые медиа не восстанавливаются.")
+    await send_home(chat_id, answer)
+
+
 async def handle_start(message: dict[str, Any]):
     chat = message.get("chat") or {}
     user = message.get("from") or {}
@@ -236,20 +312,16 @@ async def handle_start(message: dict[str, Any]):
     }, prefer="resolution=ignore-duplicates,return=minimal")
     current = await owner()
     if current and current.get("telegram_user_id") == user["id"]:
-        await tg("sendMessage", {
-            "chat_id": chat["id"],
-            "text": (
-                "BestChat подключён.\n\n"
-                "Бот архивирует только сообщения из чатов, которые ты явно разрешил "
-                "в Telegram Business, и только после включения архива. "
-                "Сохраняются полученные обычные текстовые сообщения, изменения и "
-                "события удаления. Для удалённого сообщения показывается только "
-                "то, что бот успел получить и сохранить ранее.\n\n"
-                "Одноразовые и защищённые медиа бот не перехватывает. "
-                "Файлы обычных медиа пока не скачиваются.\n\n"
-                "Команды: /enable — включить архив, /pause — остановить, /status — статус."
-            ),
-        })
+        await send_home(chat["id"],
+            "🚀 Добро пожаловать в BestChat!\n\n"
+            "🔥 Возможности бота\n"
+            "🗑 Архив событий удаления сообщений\n"
+            "✏️ История изменений сообщений\n"
+            "📸 Сохранение обычных фото и видео\n"
+            "🎥 Поддержка видеосообщений (кружков)\n"
+            "📎 Сохранение обычных документов и файлов\n\n"
+            "Для начала подключи Telegram Business. Сначала включи Business Mode / "
+            "Secretary Mode в @BotFather. Одноразовые и защищённые медиа не восстанавливаются.")
     else:
         await tg("sendMessage", {
             "chat_id": chat["id"],
@@ -293,6 +365,12 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     if not BOT_TOKEN or pool is None:
         raise HTTPException(status_code=503, detail="Bot is not configured")
     try:
+        if update.get("callback_query"):
+            await handle_callback(update["callback_query"])
+        if update.get("business_connection"):
+            connection = update["business_connection"]
+            state = "подключён" if connection.get("is_enabled", True) else "отключён"
+            await notify_owner(f"🔗 Telegram Business: бот {state}.")
         message = update.get("message")
         if message:
             text = (message.get("text") or "").strip()
@@ -328,7 +406,7 @@ async def configure_webhook():
             result = await tg("setWebhook", {
                 "url": public_url + "/telegram/webhook",
                 "secret_token": WEBHOOK_SECRET,
-                "allowed_updates": ["message", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
+                "allowed_updates": ["message", "callback_query", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
                 "drop_pending_updates": False,
             })
             log.info("Telegram webhook configured: %s", result)
