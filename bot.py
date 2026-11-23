@@ -57,7 +57,10 @@ async def db(method: str, table: str, *, params=None, body=None, prefer=None):
                 sql="INSERT INTO " + table + " (" + ", ".join(keys) + ") VALUES (" + ", ".join("$"+str(i) for i in range(1,len(vals)+1)) + ")"
                 if prefer and "resolution=merge-duplicates" in prefer:
                     updates=[k+"=EXCLUDED."+k for k in keys if k not in {"business_connection_id","chat_id","message_id"}]
-                    sql += " ON CONFLICT (business_connection_id,chat_id,message_id) DO UPDATE SET " + ", ".join(updates)
+                    if table == "business_connections":
+                        sql += " ON CONFLICT (business_connection_id) DO UPDATE SET " + ", ".join(updates)
+                    else:
+                        sql += " ON CONFLICT (business_connection_id,chat_id,message_id) DO UPDATE SET " + ", ".join(updates)
                 elif prefer and "resolution=ignore-duplicates" in prefer: sql += " ON CONFLICT DO NOTHING"
                 await conn.execute(sql,*vals)
             return None
@@ -129,7 +132,6 @@ async def handle_business_connection(connection: dict[str, Any]):
         "user_chat_id": connection.get("user_chat_id"),
         "is_enabled": is_enabled,
         "rights": rights,
-        "updated_at": "now()",
     }, prefer="resolution=merge-duplicates,return=minimal")
     # A confirmed active Business connection arms the archive automatically.
     await db("PATCH", "bot_owner", params={"id":"eq.1"},
