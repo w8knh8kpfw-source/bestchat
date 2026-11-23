@@ -42,6 +42,7 @@ async def db(method: str, table: str, *, params=None, body=None, prefer=None):
         if method == "POST":
             items=body if isinstance(body,list) else [body or {}]
             for item in items:
+                if isinstance(item.get("media"), dict): item["media"] = json.dumps(item["media"])
                 keys=list(item); vals=list(item.values())
                 if not keys or any(not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", k) for k in keys): raise ValueError("Invalid insert")
                 sql="INSERT INTO " + table + " (" + ", ".join(keys) + ") VALUES (" + ", ".join("$"+str(i) for i in range(1,len(vals)+1)) + ")"
