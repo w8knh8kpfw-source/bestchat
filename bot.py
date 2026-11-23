@@ -30,8 +30,9 @@ CREATE TABLE IF NOT EXISTS business_messages (business_connection_id text NOT NU
 CREATE TABLE IF NOT EXISTS message_edits (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, old_text text NOT NULL DEFAULT '', new_text text NOT NULL DEFAULT '', edited_at bigint, recorded_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS deletion_events (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, archived_text text NOT NULL DEFAULT '', sender text, chat_title text, detected_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS archived_media (business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, media_type text NOT NULL, file_name text, mime_type text, file_size bigint, file_bytes bytea NOT NULL, saved_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (business_connection_id,chat_id,message_id));
+CREATE TABLE IF NOT EXISTS business_connections (business_connection_id text PRIMARY KEY, user_chat_id bigint, is_enabled boolean NOT NULL DEFAULT false, rights jsonb NOT NULL DEFAULT '{}'::jsonb, connected_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
 """
-ALLOWED_TABLES = {"bot_owner","business_messages","message_edits","deletion_events","archived_media"}
+ALLOWED_TABLES = {"bot_owner","business_messages","message_edits","deletion_events","archived_media","business_connections"}
 
 async def db(method: str, table: str, *, params=None, body=None, prefer=None):
     if pool is None or table not in ALLOWED_TABLES: raise RuntimeError("Database is not ready or table is invalid")
@@ -50,6 +51,7 @@ async def db(method: str, table: str, *, params=None, body=None, prefer=None):
             items=body if isinstance(body,list) else [body or {}]
             for item in items:
                 if isinstance(item.get("media"), dict): item["media"] = json.dumps(item["media"])
+                if isinstance(item.get("rights"), dict): item["rights"] = json.dumps(item["rights"])
                 keys=list(item); vals=list(item.values())
                 if not keys or any(not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", k) for k in keys): raise ValueError("Invalid insert")
                 sql="INSERT INTO " + table + " (" + ", ".join(keys) + ") VALUES (" + ", ".join("$"+str(i) for i in range(1,len(vals)+1)) + ")"
@@ -105,14 +107,42 @@ async def owner():
     return rows[0] if rows else None
 
 
-async def notify_owner(text: str):
+async def notify_owner(text: str, *, require_enabled: bool = True):
     current = await owner()
-    if current and current.get("enabled") and current.get("telegram_user_id"):
+    if current and current.get("telegram_user_id") and (current.get("enabled") or not require_enabled):
         await tg("sendMessage", {
             "chat_id": current["telegram_user_id"],
             "text": text[:3900],
             "disable_web_page_preview": True,
         })
+
+
+async def handle_business_connection(connection: dict[str, Any]):
+    connection_id = connection.get("id")
+    if not connection_id:
+        log.warning("Business connection update has no connection id")
+        return
+    is_enabled = bool(connection.get("is_enabled"))
+    rights = connection.get("rights") or {}
+    await db("POST", "business_connections", body={
+        "business_connection_id": connection_id,
+        "user_chat_id": connection.get("user_chat_id"),
+        "is_enabled": is_enabled,
+        "rights": rights,
+        "updated_at": "now()",
+    }, prefer="resolution=merge-duplicates,return=minimal")
+    # A confirmed active Business connection arms the archive automatically.
+    await db("PATCH", "bot_owner", params={"id":"eq.1"},
+             body={"enabled": is_enabled}, prefer="return=minimal")
+    readable_rights = ", ".join(k for k, v in rights.items() if v) or "права не указаны"
+    state = "подключён" if is_enabled else "отключён"
+    log.info("Business connection changed: enabled=%s rights=%s", is_enabled, readable_rights)
+    await notify_owner(
+        f"🔗 Telegram Business {state}.\n"
+        f"Права: {readable_rights}\n"
+        + ("✅ Архив автоматически включён." if is_enabled else "⏸ Архив остановлен."),
+        require_enabled=False,
+    )
 
 
 def media_summary(message: dict[str, Any]) -> dict[str, Any]:
@@ -365,12 +395,15 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     if not BOT_TOKEN or pool is None:
         raise HTTPException(status_code=503, detail="Bot is not configured")
     try:
+        event_type = next((key for key in (
+            "business_connection", "business_message", "edited_business_message",
+            "deleted_business_messages", "callback_query", "message"
+        ) if key in update), "unknown")
+        log.info("Telegram update received: %s", event_type)
         if update.get("callback_query"):
             await handle_callback(update["callback_query"])
         if update.get("business_connection"):
-            connection = update["business_connection"]
-            state = "подключён" if connection.get("is_enabled", True) else "отключён"
-            await notify_owner(f"🔗 Telegram Business: бот {state}.")
+            await handle_business_connection(update["business_connection"])
         message = update.get("message")
         if message:
             text = (message.get("text") or "").strip()
