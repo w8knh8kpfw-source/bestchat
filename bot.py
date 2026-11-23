@@ -36,7 +36,7 @@ async def db(method: str, table: str, *, params=None, body=None, prefer=None):
             for key, raw in params.items():
                 if key == "select": continue
                 if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", key) or not str(raw).startswith("eq."): raise ValueError("Invalid filter")
-                values.append(str(raw)[3:]); where.append(key + "=$" + str(len(values)))
+                value=str(raw)[3:]; values.append(int(value) if key in {"id","chat_id","message_id"} and value.isdigit() else value); where.append(key + "=$" + str(len(values)))
             sql="SELECT " + columns + " FROM " + table + ((" WHERE " + " AND ".join(where)) if where else "")
             return [dict(row) for row in await conn.fetch(sql,*values)]
         if method == "POST":
@@ -57,7 +57,7 @@ async def db(method: str, table: str, *, params=None, body=None, prefer=None):
             sets=[k+"=$"+str(i) for i,k in enumerate(data,1)]; where=[]
             for key,raw in params.items():
                 if not str(raw).startswith("eq."): raise ValueError("Invalid filter")
-                vals.append(str(raw)[3:]); where.append(key+"=$"+str(len(vals)))
+                value=str(raw)[3:]; vals.append(int(value) if key in {"id","chat_id","message_id"} and value.isdigit() else value); where.append(key+"=$"+str(len(vals)))
             await conn.execute("UPDATE "+table+" SET "+", ".join(sets)+" WHERE "+" AND ".join(where),*vals)
             return None
         raise ValueError("Unsupported database method")
