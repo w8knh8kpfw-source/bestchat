@@ -5,31 +5,64 @@ import re
 from typing import Any
 
 import httpx
+import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("bestchat")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required")
-if not WEBHOOK_SECRET:
-    raise RuntimeError("WEBHOOK_SECRET is required")
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
+pool: asyncpg.Pool | None = None
+app = FastAPI(title="BestChat Business Archive", version="1.1.0")
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS bot_owner (id integer PRIMARY KEY CHECK (id=1), telegram_user_id bigint NOT NULL UNIQUE, enabled boolean NOT NULL DEFAULT false, created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS business_messages (business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, sender text, chat_title text, text_content text NOT NULL DEFAULT '', caption_content text NOT NULL DEFAULT '', media jsonb NOT NULL DEFAULT '{}'::jsonb, message_date bigint, edited_at bigint, is_edited boolean NOT NULL DEFAULT false, saved_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (business_connection_id,chat_id,message_id));
+CREATE TABLE IF NOT EXISTS message_edits (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, old_text text NOT NULL DEFAULT '', new_text text NOT NULL DEFAULT '', edited_at bigint, recorded_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS deletion_events (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, archived_text text NOT NULL DEFAULT '', sender text, chat_title text, detected_at timestamptz NOT NULL DEFAULT now());
+"""
+ALLOWED_TABLES = {"bot_owner","business_messages","message_edits","deletion_events"}
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-DB_HEADERS = {
-    "apikey": SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-    "Content-Type": "application/json",
-}
-app = FastAPI(title="BestChat Business Archive", version="1.0.0")
-
+async def db(method: str, table: str, *, params=None, body=None, prefer=None):
+    if pool is None or table not in ALLOWED_TABLES: raise RuntimeError("Database is not ready or table is invalid")
+    async with pool.acquire() as conn:
+        if method == "GET":
+            params = params or {}; columns = params.get("select", "*")
+            if not re.fullmatch(r"[a-zA-Z0-9_, *]+", columns): raise ValueError("Invalid select")
+            where=[]; values=[]
+            for key, raw in params.items():
+                if key == "select": continue
+                if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", key) or not str(raw).startswith("eq."): raise ValueError("Invalid filter")
+                values.append(str(raw)[3:]); where.append(key + "=$" + str(len(values)))
+            sql="SELECT " + columns + " FROM " + table + ((" WHERE " + " AND ".join(where)) if where else "")
+            return [dict(row) for row in await conn.fetch(sql,*values)]
+        if method == "POST":
+            items=body if isinstance(body,list) else [body or {}]
+            for item in items:
+                keys=list(item); vals=list(item.values())
+                if not keys or any(not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", k) for k in keys): raise ValueError("Invalid insert")
+                sql="INSERT INTO " + table + " (" + ", ".join(keys) + ") VALUES (" + ", ".join("$"+str(i) for i in range(1,len(vals)+1)) + ")"
+                if prefer and "resolution=merge-duplicates" in prefer:
+                    updates=[k+"=EXCLUDED."+k for k in keys if k not in {"business_connection_id","chat_id","message_id"}]
+                    sql += " ON CONFLICT (business_connection_id,chat_id,message_id) DO UPDATE SET " + ", ".join(updates)
+                elif prefer and "resolution=ignore-duplicates" in prefer: sql += " ON CONFLICT DO NOTHING"
+                await conn.execute(sql,*vals)
+            return None
+        if method == "PATCH":
+            data=body or {}; params=params or {}; vals=list(data.values())
+            sets=[k+"=$"+str(i) for i,k in enumerate(data,1)]; where=[]
+            for key,raw in params.items():
+                if not str(raw).startswith("eq."): raise ValueError("Invalid filter")
+                vals.append(str(raw)[3:]); where.append(key+"=$"+str(len(vals)))
+            await conn.execute("UPDATE "+table+" SET "+", ".join(sets)+" WHERE "+" AND ".join(where),*vals)
+            return None
+        raise ValueError("Unsupported database method")
 
 async def tg(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is not configured")
     async with httpx.AsyncClient(timeout=25) as client:
         response = await client.post(f"{TELEGRAM_API}/{method}", json=payload)
         response.raise_for_status()
@@ -260,12 +293,14 @@ async def health():
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: str | None = Header(default=None)):
-    if not x_telegram_bot_api_secret_token or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", WEBHOOK_SECRET):
+    if not WEBHOOK_SECRET or not x_telegram_bot_api_secret_token or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", WEBHOOK_SECRET):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
     if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
     update = await request.json()
 
+    if not BOT_TOKEN or pool is None:
+        raise HTTPException(status_code=503, detail="Bot is not configured")
     try:
         message = update.get("message")
         if message:
@@ -284,26 +319,20 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
                 await handle_deleted(update)
     except Exception:
         log.exception("Failed to process Telegram update")
-        # Return 200 to avoid an endless retry storm; operational errors remain in logs.
+        raise HTTPException(status_code=500, detail="Update processing failed")
     return JSONResponse({"ok": True})
 
 
 @app.on_event("startup")
 async def configure_webhook():
-    public_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-    if public_url:
-        await tg("setWebhook", {
-            "url": public_url + "/telegram/webhook",
-            "secret_token": WEBHOOK_SECRET,
-            "allowed_updates": [
-                "message",
-                "business_connection",
-                "business_message",
-                "edited_business_message",
-                "deleted_business_messages",
-            ],
-            "drop_pending_updates": False,
-        })
+    global pool
+    if DATABASE_URL:
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, command_timeout=30)
+        async with pool.acquire() as conn: await conn.execute(SCHEMA)
+        log.info("PostgreSQL connected; schema ready")
+    else: log.warning("DATABASE_URL is missing")
+    public_url=os.getenv("RENDER_EXTERNAL_URL","").rstrip("/")
+    if public_url and BOT_TOKEN and WEBHOOK_SECRET and pool is not None:
+        await tg("setWebhook", {"url":public_url+"/telegram/webhook","secret_token":WEBHOOK_SECRET,"allowed_updates":["message","business_connection","business_message","edited_business_message","deleted_business_messages"],"drop_pending_updates":False})
         log.info("Telegram webhook configured")
-    else:
-        log.warning("RENDER_EXTERNAL_URL is missing; set webhook manually after deployment")
+    else: log.warning("Add DATABASE_URL, BOT_TOKEN and WEBHOOK_SECRET to enable the bot")
