@@ -10,6 +10,8 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("bestchat")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -66,29 +68,13 @@ async def tg(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is not configured")
     async with httpx.AsyncClient(timeout=25) as client:
         response = await client.post(f"{TELEGRAM_API}/{method}", json=payload)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            log.error("Telegram API %s failed (%s): %s", method, response.status_code, response.text[:500])
+            response.raise_for_status()
         data = response.json()
         if not data.get("ok"):
             raise RuntimeError(f"Telegram API error: {data}")
         return data.get("result", {})
-
-
-async def db(method: str, table: str, *, params=None, body=None, prefer=None):
-    headers = dict(DB_HEADERS)
-    if prefer:
-        headers["Prefer"] = prefer
-    async with httpx.AsyncClient(timeout=25) as client:
-        response = await client.request(
-            method,
-            f"{SUPABASE_URL}/rest/v1/{table}",
-            params=params,
-            json=body,
-            headers=headers,
-        )
-        if response.status_code >= 400:
-            log.error("Supabase %s %s: %s", method, table, response.text[:1000])
-            response.raise_for_status()
-        return response.json() if response.content else None
 
 
 async def owner():
@@ -334,6 +320,17 @@ async def configure_webhook():
     else: log.warning("DATABASE_URL is missing")
     public_url=os.getenv("RENDER_EXTERNAL_URL","").rstrip("/")
     if public_url and BOT_TOKEN and WEBHOOK_SECRET and pool is not None:
-        await tg("setWebhook", {"url":public_url+"/telegram/webhook","secret_token":WEBHOOK_SECRET,"allowed_updates":["message","business_connection","business_message","edited_business_message","deleted_business_messages"],"drop_pending_updates":False})
-        log.info("Telegram webhook configured")
-    else: log.warning("Add DATABASE_URL, BOT_TOKEN and WEBHOOK_SECRET to enable the bot")
+        try:
+            result = await tg("setWebhook", {
+                "url": public_url + "/telegram/webhook",
+                "secret_token": WEBHOOK_SECRET,
+                "allowed_updates": ["message", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
+                "drop_pending_updates": False,
+            })
+            log.info("Telegram webhook configured: %s", result)
+        except httpx.HTTPStatusError:
+            log.exception("Webhook registration failed. App remains online; fix the Telegram API error and redeploy.")
+        except Exception:
+            log.exception("Webhook registration failed unexpectedly. App remains online.")
+    else:
+        log.warning("Add DATABASE_URL, BOT_TOKEN and WEBHOOK_SECRET to enable the bot")
