@@ -241,6 +241,12 @@ async def save_business_message(message: dict[str, Any], edited: bool = False):
     sender = sender_label(message)
     media = media_summary(message)
     old = existing[0] if existing else None
+    old_media = (old or {}).get("media") or {}
+    if isinstance(old_media, str):
+        try:
+            old_media = json.loads(old_media)
+        except Exception:
+            old_media = {}
 
     if edited and old:
         await db("POST", "message_edits", body={
@@ -265,7 +271,7 @@ async def save_business_message(message: dict[str, Any], edited: bool = False):
              prefer="resolution=merge-duplicates,return=minimal")
 
     if media.get("file_id"):
-        already_copied = bool(old and (old.get("media") or {}).get("file_id") == media.get("file_id"))
+        already_copied = bool(old and old_media.get("file_id") == media.get("file_id"))
         if not already_copied:
             try:
                 await archive_media_to_owner(
@@ -328,11 +334,22 @@ async def handle_deleted(update: dict[str, Any]):
             "chat_title": (saved or {}).get("chat_title") or chat.get("title") or str(chat_id),
         }, prefer="return=minimal")
         if saved:
+            saved_media = saved.get("media") or {}
+            if isinstance(saved_media, str):
+                try:
+                    saved_media = json.loads(saved_media)
+                except Exception:
+                    saved_media = {}
+            archived_content = (
+                saved.get("text_content") or saved.get("caption_content")
+                or ("📎 Копия медиа уже отправлена в архивный чат BestChat."
+                    if saved_media.get("file_id") else "[сообщение без текста]")
+            )
             await notify_owner(
                 "🗑 Удалённое сообщение\n"
                 f"От: {saved.get('sender') or 'неизвестно'}\n"
                 f"Чат: {saved.get('chat_title')}\n\n"
-                f"{saved.get('text_content') or saved.get('caption_content') or '[медиа или сообщение без текста]'}"
+                f"{archived_content}"
             )
         else:
             await notify_owner(
