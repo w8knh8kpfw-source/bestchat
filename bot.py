@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import re
+import hashlib
 from typing import Any
 
 import httpx
@@ -16,7 +17,10 @@ log = logging.getLogger("bestchat")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_SECRET_RAW = os.getenv("WEBHOOK_SECRET", "")
+# Telegram accepts only A-Z, a-z, 0-9, underscore and hyphen.
+# Hashing the configured value produces a stable, valid 64-character secret.
+WEBHOOK_SECRET = hashlib.sha256(WEBHOOK_SECRET_RAW.encode("utf-8")).hexdigest() if WEBHOOK_SECRET_RAW else ""
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 pool: asyncpg.Pool | None = None
 app = FastAPI(title="BestChat Business Archive", version="1.1.0")
@@ -328,8 +332,9 @@ async def configure_webhook():
                 "drop_pending_updates": False,
             })
             log.info("Telegram webhook configured: %s", result)
-        except httpx.HTTPStatusError:
-            log.exception("Webhook registration failed. App remains online; fix the Telegram API error and redeploy.")
+        except httpx.HTTPStatusError as exc:
+            # Do not log the exception traceback: httpx includes the bot-token URL in it.
+            log.error("Webhook registration failed with HTTP %s. App remains online.", exc.response.status_code)
         except Exception:
             log.exception("Webhook registration failed unexpectedly. App remains online.")
     else:
