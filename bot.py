@@ -344,6 +344,9 @@ async def handle_start(message: dict[str, Any]):
     }, prefer="resolution=ignore-duplicates,return=minimal")
     current = await owner()
     if current and current.get("telegram_user_id") == user["id"]:
+        # Starting the bot arms the archive; a connected Business account can then be processed.
+        await db("PATCH", "bot_owner", params={"id":"eq.1"},
+                 body={"enabled":True}, prefer="return=minimal")
         await send_home(chat["id"],
             "🚀 Добро пожаловать в BestChat!\n\n"
             "🔥 Возможности бота\n"
@@ -352,8 +355,8 @@ async def handle_start(message: dict[str, Any]):
             "📸 Сохранение обычных фото и видео\n"
             "🎥 Поддержка видеосообщений (кружков)\n"
             "📎 Сохранение обычных документов и файлов\n\n"
-            "Для начала подключи Telegram Business. Сначала включи Business Mode / "
-            "Secretary Mode в @BotFather. Одноразовые и защищённые медиа не восстанавливаются.")
+            "Архив включён. Если Telegram Business уже подключён, новые доступные события будут обрабатываться автоматически. "
+            "Одноразовые и защищённые медиа не восстанавливаются.")
     else:
         await tg("sendMessage", {
             "chat_id": chat["id"],
