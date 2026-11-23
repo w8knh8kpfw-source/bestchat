@@ -178,6 +178,45 @@ def sender_label(message: dict[str, Any]) -> str:
     return name or f"user:{user.get('id', 'unknown')}"
 
 
+async def archive_media_to_owner(message: dict[str, Any], media: dict[str, Any], chat_title: str, sender: str):
+    """Copy ordinary media into the owner's BestChat chat so it remains visible after deletion."""
+    current = await owner()
+    if not current or not current.get("enabled") or not media.get("file_id"):
+        return
+    kind = media.get("type")
+    methods = {
+        "photo": "sendPhoto",
+        "video": "sendVideo",
+        "voice": "sendVoice",
+        "audio": "sendAudio",
+        "video_note": "sendVideoNote",
+        "document": "sendDocument",
+        "animation": "sendAnimation",
+        "sticker": "sendSticker",
+    }
+    method = methods.get(kind)
+    if not method:
+        log.info("Media type not supported for owner copy: %s", kind)
+        return
+    caption = (
+        "📥 BestChat · архив медиа\n"
+        f"От: {sender}\n"
+        f"Чат: {chat_title}"
+    )
+    original_caption = (message.get("caption") or "").strip()
+    if original_caption:
+        caption += "\n\n" + original_caption
+    payload = {"chat_id": current["telegram_user_id"], method.removeprefix("send").lower(): media["file_id"]}
+    # Telegram captions are supported for these media types; sticker and video-note need a separate header.
+    if kind in {"sticker", "video_note"}:
+        await tg("sendMessage", {"chat_id": current["telegram_user_id"], "text": caption[:3900]})
+        payload.pop(method.removeprefix("send").lower(), None)
+        payload["video_note" if kind == "video_note" else "sticker"] = media["file_id"]
+    else:
+        payload["caption"] = caption[:1024]
+    await tg(method, payload)
+
+
 async def save_business_message(message: dict[str, Any], edited: bool = False):
     connection_id = message.get("business_connection_id")
     chat = message.get("chat") or {}
@@ -226,16 +265,33 @@ async def save_business_message(message: dict[str, Any], edited: bool = False):
              prefer="resolution=merge-duplicates,return=minimal")
 
     if media.get("file_id"):
-        file_bytes = await download_media(media["file_id"])
-        if file_bytes is not None:
-            await db("POST", "archived_media", body={
-                **key,
-                "media_type": media.get("type") or "file",
-                "file_name": media.get("file_name"),
-                "mime_type": media.get("mime_type"),
-                "file_size": len(file_bytes),
-                "file_bytes": file_bytes,
-            }, prefer="resolution=merge-duplicates,return=minimal")
+        already_copied = bool(old and (old.get("media") or {}).get("file_id") == media.get("file_id"))
+        if not already_copied:
+            try:
+                await archive_media_to_owner(
+                    message, media, payload["chat_title"], sender
+                )
+            except Exception:
+                # A media delivery error must not discard the text/metadata archive.
+                log.exception("Could not copy media to the BestChat archive chat")
+        # Keep a binary database copy when Telegram permits downloading the file.
+        # Telegram Bot API getFile downloads are limited to 20 MB; the owner-chat
+        # copy above uses the original file_id and is independent of this limit.
+        try:
+            file_size = int(media.get("file_size") or 0)
+            if file_size <= 20 * 1024 * 1024:
+                file_bytes = await download_media(media["file_id"])
+                if file_bytes is not None:
+                    await db("POST", "archived_media", body={
+                        **key,
+                        "media_type": media.get("type") or "file",
+                        "file_name": media.get("file_name"),
+                        "mime_type": media.get("mime_type"),
+                        "file_size": len(file_bytes),
+                        "file_bytes": file_bytes,
+                    }, prefer="resolution=merge-duplicates,return=minimal")
+        except Exception:
+            log.exception("Could not store the optional binary media copy")
 
     if edited and old:
         await notify_owner(
@@ -259,7 +315,7 @@ async def handle_deleted(update: dict[str, Any]):
             "business_connection_id": f"eq.{connection_id}",
             "chat_id": f"eq.{chat_id}",
             "message_id": f"eq.{message_id}",
-            "select": "sender,chat_title,text_content,caption_content,message_date",
+            "select": "sender,chat_title,text_content,caption_content,message_date,media",
         })
         saved = rows[0] if rows else None
         await db("POST", "deletion_events", body={
@@ -311,12 +367,18 @@ async def handle_callback(query: dict[str, Any]):
             await tg("sendMessage", {"chat_id": chat_id, "text": "Это меню доступно только владельцу BestChat."})
         return
     if data == "connect":
-        answer = ("🔌 ПОДКЛЮЧЕНИЕ TELEGRAM BUSINESS\n\n"
-                  "1. Открой @BotFather и выбери BestChat.\n"
-                  "2. Включи Business Mode / Secretary Mode в настройках бота.\n"
-                  "3. Открой Настройки Telegram → Telegram Business → Чат-боты.\n"
-                  "4. Выбери BestChat, укажи доступные чаты и подтверди подключение.\n\n"
-                  "Без включённого Secretary Mode Telegram не разрешит подключение.")
+        connections = await db("GET", "business_connections", params={
+            "is_enabled": "eq.true",
+            "select": "business_connection_id,is_enabled",
+        })
+        answer = (
+            "📡 ПОДКЛЮЧЕНИЕ TELEGRAM BUSINESS\n\n"
+            + ("✅ Аккаунт подключён. BestChat получает доступные Business-события."
+               if connections else
+               "Пока нет активного Business-подключения. Подключение выполняется в самом Telegram: "
+               "Настройки → Telegram Business → Чат-боты. Никаких повторных действий в BotFather "
+               "для уже подключённого аккаунта не требуется.")
+        )
     elif data == "enable":
         await db("PATCH", "bot_owner", params={"id":"eq.1"}, body={"enabled":True}, prefer="return=minimal")
         answer = "✅ Архив включён. Сохраняются только данные, которые Telegram передаёт подключённому бизнес-боту."
@@ -324,7 +386,17 @@ async def handle_callback(query: dict[str, Any]):
         await db("PATCH", "bot_owner", params={"id":"eq.1"}, body={"enabled":False}, prefer="return=minimal")
         answer = "⏸ Архив приостановлен."
     elif data == "status":
-        answer = "📊 Архив: " + ("включён" if current.get("enabled") else "приостановлен") + "\nПодключение проверь в настройках Telegram Business."
+        connections = await db("GET", "business_connections", params={
+            "is_enabled": "eq.true",
+            "select": "business_connection_id,is_enabled",
+        })
+        answer = (
+            "📊 СТАТУС BESTCHAT\n\n"
+            f"Архив: {'🟢 включён' if current.get('enabled') else '⏸ приостановлен'}\n"
+            f"Telegram Business: {'🟢 подключён' if connections else '⚪ не подтверждён'}\n"
+            "Медиа-копии: отправляются в этот чат при получении обычного вложения.\n"
+            "Бинарная копия в базе: дополнительно, если файл доступен для скачивания."
+        )
     else:
         answer = ("❔ BestChat сохраняет обычные бизнес-сообщения, изменения, события удаления, "
                   "а также доступные обычные фото, видео, кружки и документы. "
@@ -355,6 +427,7 @@ async def handle_start(message: dict[str, Any]):
             "📸 Сохранение обычных фото и видео\n"
             "🎥 Поддержка видеосообщений (кружков)\n"
             "📎 Сохранение обычных документов и файлов\n\n"
+            "Копии обычных вложений будут приходить прямо в этот чат BestChat.\n"
             "Архив включён. Если Telegram Business уже подключён, новые доступные события будут обрабатываться автоматически. "
             "Одноразовые и защищённые медиа не восстанавливаются.")
     else:
