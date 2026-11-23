@@ -1,3 +1,10 @@
+databases:
+  - name: bestchat-db
+    databaseName: bestchat_db
+    user: bestchat_db_user
+    plan: free
+    region: frankfurt
+    postgresMajorVersion: 17
 services:
   - type: web
     name: bestchat
@@ -9,7 +16,9 @@ services:
     healthCheckPath: /
     envVars:
       - key: DATABASE_URL
-        sync: false
+        fromDatabase:
+          name: bestchat-db
+          property: connectionString
       - key: BOT_TOKEN
         sync: false
       - key: WEBHOOK_SECRET
