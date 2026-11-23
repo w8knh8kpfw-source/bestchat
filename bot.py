@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS message_edits (id bigint GENERATED ALWAYS AS IDENTITY
 CREATE TABLE IF NOT EXISTS deletion_events (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, archived_text text NOT NULL DEFAULT '', sender text, chat_title text, detected_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS archived_media (business_connection_id text NOT NULL, chat_id bigint NOT NULL, message_id bigint NOT NULL, media_type text NOT NULL, file_name text, mime_type text, file_size bigint, file_bytes bytea NOT NULL, saved_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (business_connection_id,chat_id,message_id));
 """
-ALLOWED_TABLES = {"bot_owner","business_messages","message_edits","deletion_events"}
+ALLOWED_TABLES = {"bot_owner","business_messages","message_edits","deletion_events","archived_media"}
 
 async def db(method: str, table: str, *, params=None, body=None, prefer=None):
     if pool is None or table not in ALLOWED_TABLES: raise RuntimeError("Database is not ready or table is invalid")
